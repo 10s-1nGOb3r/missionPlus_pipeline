@@ -1,0 +1,274 @@
+import paramiko
+import pandas as pd
+import os
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from dotenv import load_dotenv
+
+# 1. Load variables
+load_dotenv()
+
+# --- CONFIGURATION ---
+SFTP_HOST = os.getenv("SFTP_HOST")
+SFTP_PORT = int(os.getenv("SFTP_PORT", 2221))
+SFTP_USER = os.getenv("SFTP_USER")
+SFTP_PASS = os.getenv("SFTP_PASS")
+REMOTE_DIR = os.getenv("REMOTE_PATH", "/") 
+
+# PATH SETUP
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STAGING_DIR = os.path.join(SCRIPT_DIR, "downloads")
+OUTPUT_DIR = SCRIPT_DIR
+
+def create_sftp_client(host, port, user, password):
+    try:
+        transport = paramiko.Transport((host, port))
+        transport.connect(username=user, password=password)
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        return sftp, transport
+    except Exception as e:
+        print(f"Error connecting to SFTP: {e}")
+        return None, None
+
+def download_xml_files(sftp):
+    if not os.path.exists(STAGING_DIR):
+        os.makedirs(STAGING_DIR)
+
+    print(f"Listing files in {REMOTE_DIR}...")
+    try:
+        files = sftp.listdir(REMOTE_DIR)
+    except Exception as e:
+        print(f"Error listing remote files: {e}")
+        return []
+
+    xml_files = [f for f in files if f.endswith('.xml')]
+    local_paths = []
+    print(f"Found {len(xml_files)} XML files.")
+
+    for file in xml_files:
+        remote_path = os.path.join(REMOTE_DIR, file)
+        local_path = os.path.join(STAGING_DIR, file)
+        
+        if not os.path.exists(local_path):
+            print(f"Downloading {file}...")
+            sftp.get(remote_path, local_path)
+        
+        local_paths.append(local_path)
+    
+    return local_paths
+
+def calculate_hours(start_str, end_str):
+    if not start_str or not end_str:
+        return None
+    try:
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        t1 = datetime.strptime(start_str, fmt)
+        t2 = datetime.strptime(end_str, fmt)
+        diff = t2 - t1
+        return round(diff.total_seconds() / 3600, 2)
+    except Exception:
+        return None
+
+def parse_citilink_xml(file_path):
+    try:
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+        
+        data = {}
+        data['filename'] = os.path.basename(file_path)
+
+        def find_node(parent, tag_name):
+            if parent is None: return None
+            for child in parent.iter(): 
+                if child.tag.endswith(tag_name):
+                    return child
+            return None
+
+        # --- 1. HEADER & FLIGHT ID ---
+        flight_node = find_node(root, "Flight")
+        if flight_node is not None:
+            data['flight_origin_date'] = flight_node.get('flightOriginDate')
+            
+            # Identifiers
+            flight_id_node = find_node(flight_node, "FlightIdentifier")
+            data['flight_id'] = flight_id_node.text if flight_id_node is not None else ""
+            
+            comm_num_node = find_node(flight_node, "CommercialFlightNumber")
+            data['flight_number'] = comm_num_node.text if comm_num_node is not None else ""
+            
+            # Route
+            dep_node = find_node(flight_node, "DepartureAirport")
+            if dep_node is not None:
+                data['origin_iata'] = find_node(dep_node, "AirportIATACode").text
+
+            arr_node = find_node(flight_node, "ArrivalAirport")
+            if arr_node is not None:
+                data['dest_iata'] = find_node(arr_node, "AirportIATACode").text
+
+        # --- 2. AIRCRAFT ---
+        aircraft_node = find_node(root, "Aircraft")
+        if aircraft_node is not None:
+            data['aircraft_reg'] = aircraft_node.get('aircraftRegistration')
+
+        # --- 3. TIMES & CALCULATIONS ---
+        report_node = find_node(root, "GeneralFlightReport")
+        if report_node is not None:
+            out_node = find_node(report_node, "Out")
+            data['out_time'] = find_node(out_node, "Time").get('time') if out_node else None
+            data['fuel_out'] = find_node(out_node, "FuelOnBoard").get('fuelMass') if out_node else None
+            
+            off_node = find_node(report_node, "Off")
+            data['off_time'] = find_node(off_node, "Time").get('time') if off_node else None
+
+            on_node = find_node(report_node, "On")
+            data['on_time'] = find_node(on_node, "Time").get('time') if on_node else None
+
+            in_node = find_node(report_node, "In")
+            data['in_time'] = find_node(in_node, "Time").get('time') if in_node else None
+            data['fuel_in'] = find_node(in_node, "FuelOnBoard").get('fuelMass') if in_node else None
+
+            # Calculate Hours
+            data['block_hour'] = calculate_hours(data['out_time'], data['in_time'])
+            data['air_time'] = calculate_hours(data['off_time'], data['on_time'])
+
+        # --- 4. OPERATION DETAILS (Fuel Uplift & Flight Type) ---
+        op_node = find_node(root, "Operation")
+        if op_node is not None:
+            # A. Fuel Uplift
+            fuel_report = find_node(op_node, "FuelReport")
+            if fuel_report:
+                refuel_node = find_node(fuel_report, "RefuelingAction")
+                if refuel_node:
+                    uplift_node = find_node(refuel_node, "FuelUplift")
+                    if uplift_node is not None:
+                        data['fuel_uplift'] = uplift_node.get('fuelUplift')
+
+            # B. Flight Type (NEW!)
+            ft_node = find_node(op_node, "FlightType")
+            if ft_node is not None:
+                data['flight_type'] = ft_node.get('flightType')
+
+        # --- 5. CREW LIST (FIXED ID & MERGED) ---
+        crew_list_node = find_node(root, "CrewListDetails")
+        formatted_crew = []
+
+        if crew_list_node is not None:
+            for crew_info in crew_list_node.iter():
+                if crew_info.tag.endswith("CrewInfo"):
+                    
+                    # A. Find Name
+                    name = ""
+                    for pi in crew_info.iter():
+                        if pi.tag.endswith("PersonalInfo") and pi.get("surname"):
+                            name = pi.get("surname")
+                            break
+                    
+                    # B. Find Rank & ID
+                    rank = ""
+                    emp_id = ""
+                    crew_data = find_node(crew_info, "Crew")
+                    if crew_data is not None:
+                        rank = crew_data.get('rank', '')
+                        # Try multiple attribute names for ID
+                        emp_id = (crew_data.get('employeeId') or 
+                                  crew_data.get('staffNumber') or 
+                                  crew_data.get('memberID') or 
+                                  "")
+
+                    if name:
+                        # Format: "RANK NAME (ID)"
+                        entry = f"{rank} {name} ({emp_id})".strip()
+                        formatted_crew.append(entry)
+
+        # Join with commas
+        data['crew_details'] = ", ".join(formatted_crew)
+
+        return data
+
+    except Exception as e:
+        print(f"Error parsing {file_path}: {e}")
+        return None
+
+def process_and_export(file_list):
+    print("\n--- DATE CONFIGURATION ---")
+    start_input = input("Enter Start Date (YYYY-MM-DD): ")
+    end_input = input("Enter End Date (YYYY-MM-DD): ")
+    
+    try:
+        start_date = datetime.strptime(start_input, "%Y-%m-%d")
+        end_date = datetime.strptime(end_input, "%Y-%m-%d")
+    except ValueError:
+        print("Invalid date format.")
+        return False
+
+    all_data = []
+    print(f"\n--- PROCESSING {len(file_list)} FILES ---")
+
+    for file_path in file_list:
+        row = parse_citilink_xml(file_path)
+        
+        if row and row.get('flight_origin_date'):
+            try:
+                date_str = row['flight_origin_date'][:10]
+                row_date = datetime.strptime(date_str, "%Y-%m-%d")
+
+                if start_date <= row_date <= end_date:
+                    all_data.append(row)
+            except Exception as e:
+                print(f"  -> Date Parse Error: {e}")
+
+    if all_data:
+        df = pd.DataFrame(all_data)
+        
+        # Clean Column Order (Added flight_type)
+        key_cols = [
+            'flight_origin_date', 'flight_number', 'flight_type', 'origin_iata', 'dest_iata', 'aircraft_reg',
+            'block_hour', 'air_time',
+            'out_time', 'in_time', 'off_time', 'on_time', 
+            'fuel_out', 'fuel_in', 'fuel_uplift',
+            'crew_details', 
+            'filename', 'flight_id' 
+        ]
+        
+        existing_keys = [c for c in key_cols if c in df.columns]
+        other_keys = [c for c in df.columns if c not in existing_keys]
+        df = df[existing_keys + other_keys]
+
+        filename = f"FlightReport_{start_input}_to_{end_input}.csv"
+        output_path = os.path.join(OUTPUT_DIR, filename)
+        
+        df.to_csv(output_path, index=False)
+        print(f"\n✅ SUCCESS! File saved: {output_path}")
+        return True
+    else:
+        print("\nNo flights found.")
+        return False
+
+def run_pipeline():
+    sftp, transport = create_sftp_client(SFTP_HOST, SFTP_PORT, SFTP_USER, SFTP_PASS)
+    
+    local_files = []
+    if sftp:
+        local_files = download_xml_files(sftp)
+        sftp.close()
+        transport.close()
+    else:
+        local_files = [os.path.join(STAGING_DIR, f) for f in os.listdir(STAGING_DIR) if f.endswith('.xml')]
+
+    if not local_files:
+        print("No files to process.")
+        return
+
+    success = process_and_export(local_files)
+
+    if success:
+        print("\n--- CLEANUP PHASE ---")
+        for f in local_files:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+        print("Cleanup complete.")
+
+if __name__ == "__main__":
+    run_pipeline()
