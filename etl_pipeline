@@ -89,14 +89,12 @@ def parse_citilink_xml(file_path):
         if flight_node is not None:
             data['flight_origin_date'] = flight_node.get('flightOriginDate')
             
-            # Identifiers
             flight_id_node = find_node(flight_node, "FlightIdentifier")
             data['flight_id'] = flight_id_node.text if flight_id_node is not None else ""
             
             comm_num_node = find_node(flight_node, "CommercialFlightNumber")
             data['flight_number'] = comm_num_node.text if comm_num_node is not None else ""
             
-            # Route
             dep_node = find_node(flight_node, "DepartureAirport")
             if dep_node is not None:
                 data['origin_iata'] = find_node(dep_node, "AirportIATACode").text
@@ -127,11 +125,10 @@ def parse_citilink_xml(file_path):
             data['in_time'] = find_node(in_node, "Time").get('time') if in_node else None
             data['fuel_in'] = find_node(in_node, "FuelOnBoard").get('fuelMass') if in_node else None
 
-            # Calculate Hours
             data['block_hour'] = calculate_hours(data['out_time'], data['in_time'])
             data['air_time'] = calculate_hours(data['off_time'], data['on_time'])
 
-        # --- 4. OPERATION DETAILS (Fuel Uplift & Flight Type) ---
+        # --- 4. OPERATION DETAILS (NEW FIELDS ADDED HERE) ---
         op_node = find_node(root, "Operation")
         if op_node is not None:
             # A. Fuel Uplift
@@ -143,44 +140,50 @@ def parse_citilink_xml(file_path):
                     if uplift_node is not None:
                         data['fuel_uplift'] = uplift_node.get('fuelUplift')
 
-            # B. Flight Type (NEW!)
+            # B. Flight Type
             ft_node = find_node(op_node, "FlightType")
             if ft_node is not None:
                 data['flight_type'] = ft_node.get('flightType')
 
-        # --- 5. CREW LIST (FIXED ID & MERGED) ---
+            # C. Who Did Takeoff (New)
+            to_node = find_node(op_node, "WhoDidTheTakeOff")
+            if to_node is not None:
+                data['pilot_takeoff'] = to_node.get('pilotName')
+
+            # D. Who Did Landing (New)
+            land_node = find_node(op_node, "WhoDidTheLanding")
+            if land_node is not None:
+                data['pilot_landing'] = land_node.get('pilotName')
+
+            # E. Arrival Airport Type (New)
+            act_arr_node = find_node(op_node, "ActualArrivalAirport")
+            if act_arr_node is not None:
+                data['arrival_type'] = act_arr_node.get('ArrivalAirportType')
+
+        # --- 5. CREW LIST (MERGED) ---
         crew_list_node = find_node(root, "CrewListDetails")
         formatted_crew = []
 
         if crew_list_node is not None:
             for crew_info in crew_list_node.iter():
                 if crew_info.tag.endswith("CrewInfo"):
-                    
-                    # A. Find Name
                     name = ""
                     for pi in crew_info.iter():
                         if pi.tag.endswith("PersonalInfo") and pi.get("surname"):
                             name = pi.get("surname")
                             break
                     
-                    # B. Find Rank & ID
                     rank = ""
                     emp_id = ""
                     crew_data = find_node(crew_info, "Crew")
                     if crew_data is not None:
                         rank = crew_data.get('rank', '')
-                        # Try multiple attribute names for ID
-                        emp_id = (crew_data.get('employeeId') or 
-                                  crew_data.get('staffNumber') or 
-                                  crew_data.get('memberID') or 
-                                  "")
+                        emp_id = (crew_data.get('employeeId') or crew_data.get('staffNumber') or crew_data.get('memberID') or "")
 
                     if name:
-                        # Format: "RANK NAME (ID)"
                         entry = f"{rank} {name} ({emp_id})".strip()
                         formatted_crew.append(entry)
 
-        # Join with commas
         data['crew_details'] = ", ".join(formatted_crew)
 
         return data
@@ -220,12 +223,14 @@ def process_and_export(file_list):
     if all_data:
         df = pd.DataFrame(all_data)
         
-        # Clean Column Order (Added flight_type)
+        # Clean Column Order (Updated with 3 new fields)
         key_cols = [
-            'flight_origin_date', 'flight_number', 'flight_type', 'origin_iata', 'dest_iata', 'aircraft_reg',
+            'flight_origin_date', 'flight_number', 'flight_type', 'arrival_type', # Added arrival_type
+            'origin_iata', 'dest_iata', 'aircraft_reg',
             'block_hour', 'air_time',
             'out_time', 'in_time', 'off_time', 'on_time', 
             'fuel_out', 'fuel_in', 'fuel_uplift',
+            'pilot_takeoff', 'pilot_landing', # Added Pilots
             'crew_details', 
             'filename', 'flight_id' 
         ]
