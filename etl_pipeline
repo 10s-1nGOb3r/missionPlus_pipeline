@@ -2,7 +2,7 @@ import paramiko
 import pandas as pd
 import os
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # 1. Load variables
@@ -18,7 +18,11 @@ REMOTE_DIR = os.getenv("REMOTE_PATH", "/")
 # PATH SETUP
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STAGING_DIR = os.path.join(SCRIPT_DIR, "downloads")
-OUTPUT_DIR = SCRIPT_DIR
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "csv")  # <--- CHANGED: Now points to 'csv' folder
+HISTORY_FILE = os.path.join(SCRIPT_DIR, "processed_history.log")
+
+# SAFETY LIMIT
+LOOKBACK_DAYS = 30 
 
 def create_sftp_client(host, port, user, password):
     try:
@@ -30,22 +34,55 @@ def create_sftp_client(host, port, user, password):
         print(f"Error connecting to SFTP: {e}")
         return None, None
 
-def download_xml_files(sftp):
+def load_history():
+    if not os.path.exists(HISTORY_FILE):
+        return set()
+    with open(HISTORY_FILE, 'r') as f:
+        return set(line.strip() for line in f)
+
+def update_history(new_files):
+    with open(HISTORY_FILE, 'a') as f:
+        for file in new_files:
+            f.write(f"{os.path.basename(file)}\n")
+
+def download_new_files(sftp, history_set):
     if not os.path.exists(STAGING_DIR):
         os.makedirs(STAGING_DIR)
 
     print(f"Listing files in {REMOTE_DIR}...")
     try:
-        files = sftp.listdir(REMOTE_DIR)
+        all_files = sftp.listdir(REMOTE_DIR)
     except Exception as e:
         print(f"Error listing remote files: {e}")
         return []
 
-    xml_files = [f for f in files if f.endswith('.xml')]
-    local_paths = []
-    print(f"Found {len(xml_files)} XML files.")
+    target_files = []
+    today = datetime.now()
+    cutoff_date = today - timedelta(days=LOOKBACK_DAYS)
+    
+    print("Checking for new files...")
+    for f in all_files:
+        if not f.endswith('.xml'):
+            continue
+        
+        if f in history_set:
+            continue
 
-    for file in xml_files:
+        try:
+            parts = f.split('_')
+            if len(parts) > 2:
+                date_str = parts[2] 
+                if len(date_str) == 6 and date_str.isdigit():
+                    file_date = datetime.strptime(date_str, "%y%m%d")
+                    if file_date >= cutoff_date:
+                        target_files.append(f)
+        except Exception:
+            continue
+
+    print(f"Found {len(target_files)} NEW files that haven't been processed yet.")
+
+    local_paths = []
+    for file in target_files:
         remote_path = os.path.join(REMOTE_DIR, file)
         local_path = os.path.join(STAGING_DIR, file)
         
@@ -128,10 +165,9 @@ def parse_citilink_xml(file_path):
             data['block_hour'] = calculate_hours(data['out_time'], data['in_time'])
             data['air_time'] = calculate_hours(data['off_time'], data['on_time'])
 
-        # --- 4. OPERATION DETAILS (NEW FIELDS ADDED HERE) ---
+        # --- 4. OPERATION DETAILS ---
         op_node = find_node(root, "Operation")
         if op_node is not None:
-            # A. Fuel Uplift
             fuel_report = find_node(op_node, "FuelReport")
             if fuel_report:
                 refuel_node = find_node(fuel_report, "RefuelingAction")
@@ -140,27 +176,21 @@ def parse_citilink_xml(file_path):
                     if uplift_node is not None:
                         data['fuel_uplift'] = uplift_node.get('fuelUplift')
 
-            # B. Flight Type
             ft_node = find_node(op_node, "FlightType")
             if ft_node is not None:
                 data['flight_type'] = ft_node.get('flightType')
 
-            # C. Who Did Takeoff (New)
             to_node = find_node(op_node, "WhoDidTheTakeOff")
-            if to_node is not None:
-                data['pilot_takeoff'] = to_node.get('pilotName')
+            if to_node is not None: data['pilot_takeoff'] = to_node.get('pilotName')
 
-            # D. Who Did Landing (New)
             land_node = find_node(op_node, "WhoDidTheLanding")
-            if land_node is not None:
-                data['pilot_landing'] = land_node.get('pilotName')
+            if land_node is not None: data['pilot_landing'] = land_node.get('pilotName')
 
-            # E. Arrival Airport Type (New)
             act_arr_node = find_node(op_node, "ActualArrivalAirport")
             if act_arr_node is not None:
                 data['arrival_type'] = act_arr_node.get('ArrivalAirportType')
 
-        # --- 5. CREW LIST (MERGED) ---
+        # --- 5. CREW LIST ---
         crew_list_node = find_node(root, "CrewListDetails")
         formatted_crew = []
 
@@ -178,14 +208,13 @@ def parse_citilink_xml(file_path):
                     crew_data = find_node(crew_info, "Crew")
                     if crew_data is not None:
                         rank = crew_data.get('rank', '')
-                        emp_id = (crew_data.get('employeeId') or crew_data.get('staffNumber') or crew_data.get('memberID') or "")
+                        emp_id = (crew_data.get('employeeId') or crew_data.get('staffNumber') or "")
 
                     if name:
                         entry = f"{rank} {name} ({emp_id})".strip()
                         formatted_crew.append(entry)
 
         data['crew_details'] = ", ".join(formatted_crew)
-
         return data
 
     except Exception as e:
@@ -193,44 +222,28 @@ def parse_citilink_xml(file_path):
         return None
 
 def process_and_export(file_list):
-    print("\n--- DATE CONFIGURATION ---")
-    start_input = input("Enter Start Date (YYYY-MM-DD): ")
-    end_input = input("Enter End Date (YYYY-MM-DD): ")
-    
-    try:
-        start_date = datetime.strptime(start_input, "%Y-%m-%d")
-        end_date = datetime.strptime(end_input, "%Y-%m-%d")
-    except ValueError:
-        print("Invalid date format.")
-        return False
+    # Ensure CSV directory exists
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
 
     all_data = []
     print(f"\n--- PROCESSING {len(file_list)} FILES ---")
 
     for file_path in file_list:
         row = parse_citilink_xml(file_path)
-        
-        if row and row.get('flight_origin_date'):
-            try:
-                date_str = row['flight_origin_date'][:10]
-                row_date = datetime.strptime(date_str, "%Y-%m-%d")
-
-                if start_date <= row_date <= end_date:
-                    all_data.append(row)
-            except Exception as e:
-                print(f"  -> Date Parse Error: {e}")
+        if row:
+            all_data.append(row)
 
     if all_data:
         df = pd.DataFrame(all_data)
         
-        # Clean Column Order (Updated with 3 new fields)
         key_cols = [
-            'flight_origin_date', 'flight_number', 'flight_type', 'arrival_type', # Added arrival_type
+            'flight_origin_date', 'flight_number', 'flight_type', 'arrival_type',
             'origin_iata', 'dest_iata', 'aircraft_reg',
             'block_hour', 'air_time',
             'out_time', 'in_time', 'off_time', 'on_time', 
             'fuel_out', 'fuel_in', 'fuel_uplift',
-            'pilot_takeoff', 'pilot_landing', # Added Pilots
+            'pilot_takeoff', 'pilot_landing',
             'crew_details', 
             'filename', 'flight_id' 
         ]
@@ -239,41 +252,51 @@ def process_and_export(file_list):
         other_keys = [c for c in df.columns if c not in existing_keys]
         df = df[existing_keys + other_keys]
 
-        filename = f"FlightReport_{start_input}_to_{end_input}.csv"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        filename = f"New_Flights_Found_{timestamp}.csv"
         output_path = os.path.join(OUTPUT_DIR, filename)
         
         df.to_csv(output_path, index=False)
-        print(f"\n✅ SUCCESS! File saved: {output_path}")
+        print(f"\n✅ SUCCESS! {len(df)} new flights saved to: {output_path}")
         return True
     else:
-        print("\nNo flights found.")
+        print("\nNo valid data found in downloaded files.")
         return False
 
 def run_pipeline():
+    print("--- SMART DOWNLOADER STARTED ---")
+    
+    history = load_history()
+    print(f"History loaded: {len(history)} files previously processed.")
+
     sftp, transport = create_sftp_client(SFTP_HOST, SFTP_PORT, SFTP_USER, SFTP_PASS)
     
     local_files = []
     if sftp:
-        local_files = download_xml_files(sftp)
+        local_files = download_new_files(sftp, history)
         sftp.close()
         transport.close()
     else:
-        local_files = [os.path.join(STAGING_DIR, f) for f in os.listdir(STAGING_DIR) if f.endswith('.xml')]
+        print("Could not connect to SFTP.")
+        return
 
     if not local_files:
-        print("No files to process.")
+        print("No new files found. Everything is up to date!")
         return
 
     success = process_and_export(local_files)
 
     if success:
         print("\n--- CLEANUP PHASE ---")
+        update_history(local_files)
+        print("History log updated.")
+
         for f in local_files:
             try:
                 os.remove(f)
             except Exception:
                 pass
-        print("Cleanup complete.")
+        print("Local XML files deleted.")
 
 if __name__ == "__main__":
     run_pipeline()
